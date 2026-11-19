@@ -1,0 +1,362 @@
+name: build
+
+# Builds the Mumon browser from its private source repository, on public runners
+# (4 vCPU, 16 GB), and publishes each package here as an encrypted release.
+#
+# The source is checked out with a read-only deploy key on that one repository.
+# Nothing here runs on a pull request or a push, so no secret is reachable from a
+# fork. A package is a 7z (AES-256, file names hidden); the key is a secret of this
+# repository and of the machine that provisions the browser, and is not published.
+#
+# A cold build is hours: the compiler cache (sccache) is saved even when a build
+# is cut off at its time limit, so the next run continues from there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Comma-separated targets: windows-x86_64, linux-x86_64, linux-arm64, macos-arm64, macos-x86_64, windows-i686"
+        default: "windows-x86_64"
+      ref:
+        description: "Branch, tag or commit of the source repository"
+        default: "main"
+      prepare_only:
+        description: "Only prove the patches apply; build nothing"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.targets }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  SOURCE_REPO: cyberkunju/mumon
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      build: ${{ steps.matrix.outputs.build }}
+    steps:
+      - id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGETS: ${{ inputs.targets }}
+          PREPARE_ONLY: ${{ inputs.prepare_only }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+
+          allowed = {"windows-x86_64", "windows-i686", "linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64"}
+          build = os.environ["EVENT"] == "workflow_dispatch" and os.environ["PREPARE_ONLY"] != "true"
+          picked = [t.strip() for t in os.environ.get("TARGETS", "").split(",") if t.strip()] if build else []
+          bad = [t for t in picked if t not in allowed]
+          if bad or (build and not picked):
+              sys.exit(f"unknown or empty targets {bad or picked}; choose from {sorted(allowed)}")
+          include = [{"target": t.split("-")[0], "arch": t.split("-")[1], "name": t} for t in picked]
+          # A matrix must never be empty, even for a job that is skipped.
+          matrix = {"include": include or [{"target": "none", "arch": "none", "name": "none"}]}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"matrix={json.dumps(matrix)}\n")
+              out.write(f"build={'true' if include else 'false'}\n")
+          print(picked or "prepare only")
+          EOF
+
+  prepare:
+    # Fetches Firefox, copies the additions and applies every patch. No compiler
+    # and no toolchains, so it fails fast on a patch that no longer applies.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      BUILD_TARGET: windows,x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # 22.15 or later: the fpgen model is zstd-compressed (node:zlib).
+          node-version: "22.x"
+      - name: Build the identity generator
+        # Generates browser/additions/mumon/identity (not in the repository),
+        # which the additions copy below picks up.
+        working-directory: browser/identity
+        run: |
+          npm ci --ignore-scripts
+          node build.mjs
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y aria2
+      - name: Static checks
+        working-directory: browser
+        run: python3 scripts/check-input-dispatch.py
+      - name: Engine module tests
+        run: |
+          files=(browser/tests/mumon/*.test.mjs)
+          test -f "${files[0]}" || { echo "::error::no engine tests found"; exit 1; }
+          node --test "${files[@]}"
+      - name: Fetch Firefox and copy the additions
+        working-directory: browser
+        run: make setup-minimal
+      - name: Apply the patches
+        working-directory: browser
+        run: make dir
+      - name: Check the rebrand reached the tree
+        run: |
+          src=$(ls -d browser/mumon-*/)
+          test -f "$src/browser/branding/mumon/configure.sh"
+          test -f "$src/browser/app/mumon.exe.manifest"
+          test -f "$src/lw/mumon.cfg"
+          test -f "$src/mumon/Boot.sys.mjs"
+          test -f "$src/mumon/Identity.sys.mjs"
+          test -f "$src/mumon/identity/IdentityCore.sys.mjs"
+          test -f "$src/mumon/identity/data/fpgen/values.txt"
+          grep -q '"/mumon"' "$src/lw/moz.build"
+          grep -q 'MOZ_APP_NAME=mumon' "$src/browser/branding/mumon/configure.sh"
+          grep -q 'imply_option("MOZ_APP_UA_NAME", "Firefox")' "$src/browser/moz.configure"
+          echo "rebrand present in $src"
+
+  build:
+    needs: [plan, prepare]
+    if: needs.plan.outputs.build == 'true'
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write # publishes the package as a pre-release
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # `make dir` writes the mozconfig and adds the Rust targets from BUILD_TARGET.
+      BUILD_TARGET: ${{ matrix.target }},${{ matrix.arch }}
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 5G
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@8831c82abf29b34eb2caac48d5f999ecfc0d8eef # v4.1
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          remove-large-packages: "true"
+          remove-cached-tools: "true"
+          remove-swapfile: "true"
+          verbose: "false"
+
+      - name: Remove unwanted tools
+        run: |
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' > /dev/null 2>&1 || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox mono-devel libgl1-mesa-dri --fix-missing > /dev/null 2>&1 || true
+          sudo apt-get autoremove -y > /dev/null 2>&1 || true
+          sudo apt-get clean > /dev/null 2>&1 || true
+          echo "cpus: $(nproc)"; free -h; df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+
+      - name: Build the identity generator
+        working-directory: browser/identity
+        run: |
+          npm ci --ignore-scripts
+          node build.mjs
+
+      - name: Set up LLVM
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y lld-18 clang-18
+          if [ "${{ matrix.arch }}" != "x86_64" ]; then
+            sudo apt-get install -y libc6-i386 lib32gcc-s1 lib32stdc++6 gcc-multilib g++-multilib
+          fi
+          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # fontconfig: scripts/verify-fonts.py resolves every family through fc-list.
+          sudo apt-get install -y msitools p7zip-full aria2 fontconfig
+
+      - name: Install sccache
+        # The compiler cache. Unlike ccache it also caches Rust, which is about half of
+        # a Firefox build; base.mozconfig uses it when it is on PATH.
+        run: |
+          v=v0.19.0
+          f=sccache-$v-x86_64-unknown-linux-musl
+          curl -fsSL -o "$f.tar.gz" "https://github.com/mozilla/sccache/releases/download/$v/$f.tar.gz"
+          echo "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd  $f.tar.gz" | sha256sum -c -
+          tar -xzf "$f.tar.gz"
+          sudo install -m 755 "$f/sccache" /usr/local/bin/sccache
+          rm -rf "$f" "$f.tar.gz"
+          sccache --version
+
+      - name: Fetch and check the font bundle
+        # Only Linux ships it (browser/Makefile).
+        if: matrix.target == 'linux'
+        working-directory: browser
+        run: |
+          make fonts-extract
+          python3 -m pip install -e ../python
+          python3 scripts/verify-fonts.py
+
+      - name: Restore the compiler cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .sccache
+          # The run id makes every save a new entry, so a build that was cut off
+          # still leaves its work behind. A restore takes the newest earlier one.
+          # sccache entries are keyed by their inputs, so an older cache is still valid.
+          key: sccache-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ matrix.name }}-
+
+      - name: Prepare the source tree
+        # setup-minimal (fetches the tarball) -> dir (patches) -> mozbootstrap
+        # (toolchains), retrying the two that use the network.
+        run: |
+          mkdir -p "$SCCACHE_DIR"
+          python3 -m ci.run_prepare
+          rm -f browser/firefox-*.source.tar.xz
+          df -h /
+
+      - name: Create swap
+        # The link step is OOM-killed on a 7 GB runner without it, and reports as a
+        # bare SIGTERM. Sized to leave the disk room for the build itself.
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
+      - name: Start the resource monitor
+        # RUNNER_TRACKING_ID is cleared and setsid used so the runner does not reap it
+        # when this step ends.
+        run: RUNNER_TRACKING_ID="" setsid nohup bash .github/scripts/monitor.sh "$RUNNER_TEMP/monitor.log" > /dev/null 2>&1 < /dev/null &
+
+      - name: Build and package
+        # Leaves the job (360 min) room to save the cache after a cut-off build.
+        timeout-minutes: 300
+        env:
+          # Two rustc at a time: the runner has 16 GB, and the gkrust LTO link needs most of 8.
+          CARGO_BUILD_JOBS: "2"
+        working-directory: browser
+        run: python3 ./multibuild.py --target ${{ matrix.target }} --arch ${{ matrix.arch }}
+
+      - name: Check the package
+        # mumon.exe must carry Firefox's application manifest (Windows-10-gated media
+        # paths depend on it), and the package must hold the binary and its config.
+        run: |
+          set -euo pipefail
+          zip=$(ls browser/dist/mumon-*.zip | head -1)
+          unzip -l "$zip" > "$RUNNER_TEMP/listing.txt"
+          tail -1 "$RUNNER_TEMP/listing.txt"
+          for f in mumon.cfg properties.json omni.ja; do
+            grep -qE "[ /]$f$" "$RUNNER_TEMP/listing.txt" || { echo "::error::$f missing from $zip"; exit 1; }
+          done
+          python3 - "$zip" <<'EOF'
+          import io, sys, zipfile
+          pkg = zipfile.ZipFile(sys.argv[1])
+          names = pkg.namelist()
+          gre = next(n for n in names if n.endswith("omni.ja") and not n.endswith("browser/omni.ja"))
+          omni = zipfile.ZipFile(io.BytesIO(pkg.read(gre)))
+          engine = sorted(n for n in omni.namelist() if n.startswith("modules/mumon/"))
+          print(gre, "carries", engine)
+          assert "modules/mumon/Boot.sys.mjs" in engine, "the engine is not in omni.ja"
+          cfg = pkg.read(next(n for n in names if n.endswith("mumon.cfg"))).decode()
+          assert "resource://gre/modules/mumon/Boot.sys.mjs" in cfg, "mumon.cfg does not start the engine"
+          EOF
+          if [ "${{ matrix.target }}" = windows ]; then
+            python3 browser/tests/playwright/patches/windows-exe-manifest.py
+          fi
+
+      - name: Compiler cache statistics
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Save the compiler cache
+        # Also when the build failed or ran out of time: the cache holds everything
+        # compiled so far, which is what makes the next run shorter.
+        if: always() && steps.cache.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .sccache
+          key: sccache-${{ matrix.name }}-${{ github.run_id }}
+
+      - name: Encrypt the package
+        env:
+          PACKAGE_KEY: ${{ secrets.MUMON_PACKAGE_KEY }}
+        run: |
+          set -euo pipefail
+          zip=$(ls browser/dist/mumon-*.zip | head -1)
+          out="${zip%.zip}.7z"
+          # Stored, not compressed (the zip already is), with the file names hidden.
+          7z a -t7z -mx=0 -mhe=on "-p$PACKAGE_KEY" "$out" "$zip" > /dev/null
+          7z t "-p$PACKAGE_KEY" "$out" | tail -3
+          rm "$zip"
+          ls -l browser/dist
+          sha256sum "$out"
+
+      - name: Keep the package
+        # Before publishing, so a failed publish cannot lose a multi-hour build.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.name }}
+          path: browser/dist/mumon-*.7z
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Publish the package
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkgs=(browser/dist/mumon-*.7z)
+          test -f "${pkgs[0]}"
+          tag="build-${{ github.run_number }}-${{ matrix.name }}"
+          src=$(git rev-parse HEAD)
+          # --target main, not this run's commit: a workflow token may not create a
+          # tag at an older commit that changed a workflow file (measured: 403).
+          gh release create "$tag" "${pkgs[@]}" --repo "$GITHUB_REPOSITORY" --target main \
+            --prerelease --title "Mumon build ${{ github.run_number }} (${{ matrix.name }})" \
+            --notes "Source commit $src, run ${{ github.run_id }}. Encrypted 7z (AES-256)."
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-log-${{ matrix.name }}
+          path: ${{ runner.temp }}/monitor.log
+          if-no-files-found: ignore
+          retention-days: 14

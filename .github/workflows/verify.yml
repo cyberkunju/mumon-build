@@ -1,0 +1,325 @@
+name: verify
+
+# Checks a published build on the OS it was built for, with the code a user
+# runs. Each job builds the mumon program (cli/, Rust) from the source, tests
+# it, downloads its own package from this repository's releases, installs it
+# with `mumon install --package`, and runs the checks the Windows build passed:
+# `mumon verify` (with no Python on PATH), a diff of ~500 page-visible values
+# and of every file a page can load against the previous build for the same
+# target (compare_with), the local end-to-end scenarios through the mumon
+# program, and the bench.
+# One summary line per check at the end. When every job passes, the mumon
+# program of each target is attached to that target's release
+# (mumon-cli-<target>), where the install scripts find it.
+#
+# Python and Playwright are the test harness only (tests/requirements.txt):
+# they serve the local sites, launch both builds for the value diff, and
+# install the browser's system libraries on Linux.
+#
+# The source is read with the same read-only deploy key as the build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_number:
+        description: "Run number of the build to check (the N in the release tag build-N-<target>)"
+        required: true
+      targets:
+        description: "Comma-separated: windows-x86_64, linux-x86_64, linux-arm64, macos-arm64, macos-x86_64"
+        default: "linux-x86_64,linux-arm64,macos-arm64,macos-x86_64,windows-x86_64"
+      ref:
+        description: "Branch, tag or commit of the source repository (the mumon program and the tests)"
+        default: "main"
+      dev_copy:
+        description: "Test this source's engine and settings on a copy of the build (tests/e2e/dev_install.py) instead of the build as published; publishes nothing"
+        type: boolean
+        default: false
+      publish_cli:
+        description: "Attach the mumon program to the releases when every check passes"
+        type: boolean
+        default: true
+      compare_with:
+        description: "Build to diff page-visible values and files against: previous (the newest earlier build-N), a build number, or none (a change made on purpose)"
+        default: "previous"
+
+permissions: {}
+
+concurrency:
+  group: verify-${{ inputs.run_number }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: cyberkunju/mumon
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          TARGETS: ${{ inputs.targets }}
+          RUN_NUMBER: ${{ inputs.run_number }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, sys
+
+          runners = {
+              "windows-x86_64": "windows-2025",
+              "linux-x86_64": "ubuntu-24.04",
+              "linux-arm64": "ubuntu-24.04-arm",
+              "macos-arm64": "macos-15",
+              "macos-x86_64": "macos-15-intel",
+          }
+          # Linux: a static (musl) mumon program, so it runs on any distribution.
+          rust_targets = {"linux-x86_64": "x86_64-unknown-linux-musl", "linux-arm64": "aarch64-unknown-linux-musl"}
+          if not re.fullmatch(r"\d{1,6}", os.environ["RUN_NUMBER"]):
+              sys.exit("run_number must be a number")
+          picked = [t.strip() for t in os.environ["TARGETS"].split(",") if t.strip()]
+          bad = [t for t in picked if t not in runners]
+          if bad or not picked:
+              sys.exit(f"unknown or empty targets {bad or picked}; choose from {sorted(runners)}")
+          include = [{"name": t, "os": t.split("-")[0], "arch": t.split("-")[1], "runner": runners[t],
+                      "rust_target": rust_targets.get(t, "")} for t in picked]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"matrix={json.dumps({'include': include})}\n")
+          EOF
+
+  verify:
+    needs: plan
+    name: verify ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      MUMON_PACKAGE_KEY: ${{ secrets.MUMON_PACKAGE_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+
+      - name: The test harness and the browser's system libraries
+        run: |
+          python -m pip install --quiet -r tests/requirements.txt
+          if [ "${{ matrix.os }}" = linux ]; then
+            python -m playwright install-deps firefox
+            sudo apt-get install -y -qq xvfb musl-tools >/dev/null
+          fi
+
+      - name: Build and test the mumon program
+        id: cli
+        run: |
+          set -euo pipefail
+          command -v cargo >/dev/null || {
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; export PATH="$HOME/.cargo/bin:$PATH"
+          }
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          T="${{ matrix.rust_target }}"
+          if [ -n "$T" ]; then
+            rustup target add "$T"
+            export "CC_${T//-/_}=musl-gcc"
+          fi
+          cargo --version
+          cargo build --release --locked --manifest-path cli/Cargo.toml ${T:+--target "$T"}
+          cargo test --release --locked --manifest-path cli/Cargo.toml ${T:+--target "$T"}
+          exe=mumon; [ "${{ matrix.os }}" = windows ] && exe=mumon.exe
+          mkdir -p bin
+          cp "cli/target/${T:+$T/}release/$exe" "bin/$exe"
+          ls -l bin
+          echo "MUMON=$PWD/bin/$exe" >> "$GITHUB_ENV"
+
+      - name: Engine logic (Node)
+        id: node
+        continue-on-error: true
+        run: node --test "browser/tests/mumon/*.test.mjs"
+
+      - name: Download and install the package with the mumon program
+        env:
+          TAG: build-${{ inputs.run_number }}-${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p '*.7z' -D dl
+          ls -l dl
+          "$MUMON" install --package dl/*.7z
+          echo "EXE=$("$MUMON" path)" >> "$GITHUB_ENV"
+          rm -rf dl
+
+      - name: A dev copy with this source's engine and settings
+        if: inputs.dev_copy
+        run: |
+          set -euo pipefail
+          (cd browser/identity && npm ci --ignore-scripts && node build.mjs)
+          DEV=$(python - <<'EOF'
+          import os, shutil, tempfile
+          from pathlib import Path
+          exe = Path(os.environ["EXE"])
+          app = next((p for p in exe.parents if p.suffix == ".app"), None)
+          root = app or exe.parent
+          dst = Path(tempfile.mkdtemp(prefix="mumon-devcopy-")) / root.name
+          shutil.copytree(root, dst, symlinks=True)
+          print(dst / exe.relative_to(root))
+          EOF
+          )
+          python tests/e2e/dev_install.py --dir "$(dirname "$DEV")"
+          echo "EXE=$DEV" >> "$GITHUB_ENV"
+
+      - name: mumon verify, with no Python on PATH
+        id: verify
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # The product must not need Python: drop every Python directory from PATH.
+          export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vi python | paste -sd: -)"
+          ! command -v python && ! command -v python3 || { echo "::warning::a python is still on PATH"; }
+          "$MUMON" verify --exe "$EXE"
+          printf 'https://example.com\n' > urls.txt
+          "$MUMON" --exe "$EXE" --mode http -f urls.txt -o smoke.jsonl --summary smoke.json
+          "$MUMON" --exe "$EXE" --mode browser -f urls.txt -o smoke.jsonl --no-resume --summary smoke.json
+
+      - name: The build to compare with
+        id: prev
+        env:
+          COMPARE_WITH: ${{ inputs.compare_with }}
+          RUN_NUMBER: ${{ inputs.run_number }}
+          TARGET: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          case "$COMPARE_WITH" in
+            none) n="" ;;
+            previous)
+              n=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 500 --json tagName --jq \
+                '[.[].tagName | capture("^build-(?<n>[0-9]+)-(?<t>.+)$") | select(.t == $ENV.TARGET)
+                  | .n | tonumber | select(. < ($ENV.RUN_NUMBER | tonumber))] | max // empty') ;;
+            *)
+              [[ "$COMPARE_WITH" =~ ^[0-9]{1,6}$ ]] || { echo "::error::compare_with: previous, none or a build number"; exit 1; }
+              n="$COMPARE_WITH" ;;
+          esac
+          if [ -z "$n" ]; then
+            echo "no build to compare with (compare_with=$COMPARE_WITH): the diffs are skipped" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # Its own cache, so the two builds of one Firefox version do not share a folder.
+            export MUMON_CACHE_DIR="$RUNNER_TEMP/prev-cache"
+            mkdir -p prev-dl
+            gh release download "build-$n-$TARGET" --repo "$GITHUB_REPOSITORY" -p '*.7z' -D prev-dl
+            "$MUMON" install --package prev-dl/*.7z
+            echo "PREV=$("$MUMON" path)" >> "$GITHUB_ENV"
+            rm -rf prev-dl
+            echo "compared with build-$n-$TARGET" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Files a page can load, against that build
+        id: parity
+        if: steps.prev.outputs.n != ''
+        continue-on-error: true
+        run: python tests/e2e/parity_vs_release.py --exe "$PREV" --exe "$EXE"
+
+      - name: Page-visible values, against that build
+        id: fingerprint
+        if: steps.prev.outputs.n != ''
+        continue-on-error: true
+        # Dumped as previous, this, this, previous: a value that changes between
+        # one browser's own dumps is the host's (fingerprint_dump.py).
+        run: |
+          python -m pip install --quiet -e python
+          python tests/e2e/fingerprint_dump.py --exe "$PREV" --exe "$EXE"
+
+      - name: Loopback addresses the local scenarios serve on (macOS has only 127.0.0.1)
+        if: matrix.os == 'macos'
+        run: for i in 2 3 4 5; do sudo ifconfig lo0 alias 127.0.0.$i up; done
+
+      - name: End to end through the mumon program, local scenarios
+        id: e2e
+        continue-on-error: true
+        run: python tests/e2e/e2e.py --local --exe "$EXE" --cli "$MUMON"
+
+      - name: Speed and memory (every row checked)
+        id: bench
+        continue-on-error: true
+        run: |
+          python tests/bench/bench.py run --label "${{ matrix.name }}" --exe "$EXE" --cli "$MUMON" --only startup,http-1host,browser-render --out bench.json | tee bench.txt
+          { echo "#### bench ${{ matrix.name }}"; echo '```'; grep -E 'rows,|ERROR' bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the mumon program for the release
+        if: ${{ !inputs.dev_copy }}
+        run: |
+          set -euo pipefail
+          mkdir -p cli-out
+          name="mumon-cli-${{ matrix.name }}"; [ "${{ matrix.os }}" = windows ] && name="$name.exe"
+          cp "$MUMON" "cli-out/$name"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !inputs.dev_copy }}
+        with:
+          name: mumon-cli-${{ matrix.name }}
+          path: cli-out/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Result
+        run: |
+          {
+            echo "### ${{ matrix.name }}${{ inputs.dev_copy && ' (dev copy)' || '' }}"
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| mumon program: build and tests | ${{ steps.cli.outcome }} |"
+            echo "| engine logic (Node) | ${{ steps.node.outcome }} |"
+            echo "| mumon verify and a crawl, no Python on PATH | ${{ steps.verify.outcome }} |"
+            echo "| files a page can load = build ${{ steps.prev.outputs.n || '(none)' }} | ${{ steps.parity.outcome }} |"
+            echo "| page-visible values = build ${{ steps.prev.outputs.n || '(none)' }} | ${{ steps.fingerprint.outcome }} |"
+            echo "| end to end (local) | ${{ steps.e2e.outcome }} |"
+            echo "| bench rows correct | ${{ steps.bench.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for o in "${{ steps.cli.outcome }}" "${{ steps.node.outcome }}" "${{ steps.verify.outcome }}" "${{ steps.prev.outcome }}" "${{ steps.parity.outcome }}" "${{ steps.fingerprint.outcome }}" "${{ steps.e2e.outcome }}" "${{ steps.bench.outcome }}"; do
+            [ "$o" = success ] || [ "$o" = skipped ] || { echo "::error::a check did not pass"; exit 1; }
+          done
+
+  publish:
+    # Only when every target passed, and only a build checked as published.
+    needs: verify
+    if: ${{ success() && inputs.publish_cli && !inputs.dev_copy }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # attaches the mumon program to the build's releases
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_NUMBER: ${{ inputs.run_number }}
+    steps:
+      - name: Attach the mumon program to each target's release
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" -p 'mumon-cli-*' -D cli
+          for dir in cli/mumon-cli-*; do
+            target="${dir#cli/mumon-cli-}"
+            gh release upload "build-$RUN_NUMBER-$target" "$dir"/* --repo "$GITHUB_REPOSITORY" --clobber
+            echo "build-$RUN_NUMBER-$target: $(ls "$dir")" >> "$GITHUB_STEP_SUMMARY"
+          done

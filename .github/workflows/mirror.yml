@@ -1,0 +1,62 @@
+name: mirror
+
+# Copies a data file the build or the mumon program downloads into a release of
+# this repository, so every download comes from here.
+#
+#   manual dispatch  one file: its url, the release tag and asset name, and the
+#                    sha256 it must have (the release is left untouched otherwise)
+#   weekly           the GeoIP database: secrets.MIRROR_SOURCE to release
+#                    geoip-latest, asset geoip-aio-all.mmdb.zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Where to fetch the file"
+        required: true
+      tag:
+        description: "Release tag to put it in"
+        required: true
+      asset:
+        description: "Asset name"
+        required: true
+      sha256:
+        description: "Expected sha256 (empty: none checked)"
+        default: ""
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: mirror-${{ github.event_name }}-${{ inputs.tag || 'geoip-latest' }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      URL: ${{ inputs.url || secrets.MIRROR_SOURCE }}
+      TAG: ${{ inputs.tag || 'geoip-latest' }}
+      ASSET: ${{ inputs.asset || 'geoip-aio-all.mmdb.zip' }}
+      SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: Fetch, check and publish
+        run: |
+          set -euo pipefail
+          test -n "$URL" || { echo "::error::no source url"; exit 1; }
+          curl -fL --retry 3 -o "$RUNNER_TEMP/$ASSET" "$URL"
+          got=$(sha256sum "$RUNNER_TEMP/$ASSET" | cut -d' ' -f1)
+          echo "size $(stat -c %s "$RUNNER_TEMP/$ASSET"), sha256 $got"
+          if [ -n "$SHA256" ] && [ "$got" != "$SHA256" ]; then
+            echo "::error::sha256 $got, expected $SHA256"; exit 1
+          fi
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
+              --title "$TAG" --notes "Data the build or the mumon program downloads. Credits: see the source's CREDITS.md."
+          fi
+          gh release upload "$TAG" "$RUNNER_TEMP/$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
