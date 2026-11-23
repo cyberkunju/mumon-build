@@ -6,8 +6,11 @@ GitHub's larger public runners.
 
 - Run a build by hand: *Actions → build → Run workflow*, choose targets
   (`windows-x86_64`, `linux-x86_64`, `linux-arm64`, `macos-arm64`, `macos-x86_64`).
-- It reads the source with a read-only deploy key, builds the browser (a Firefox
-  build with patches applied), and publishes each package as a release.
+- It reads the source and the build tools (two private repositories) with a
+  read-only deploy key each, builds the browser (a Firefox build with patches
+  applied), and publishes each package as a release.
+- *check* replays the patches and runs the tests for each push to the source,
+  without building the browser.
 - A package is an encrypted 7z. The key is not published.
 - *verify* checks a build on each OS and, when every check passes, attaches the
   `mumon` program for that OS (`mumon-cli-<os>-<arch>`) to its release.

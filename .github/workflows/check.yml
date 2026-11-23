@@ -1,0 +1,224 @@
+name: check
+run-name: check mumon ${{ inputs.ref }} with workspace ${{ inputs.workspace_ref }}
+
+# Checks a mumon commit with the build tools and tests of a mumon-workspace
+# commit, without building the browser:
+#
+#   prepare   the identity generator builds, the static checks and the engine's
+#             Node tests pass, and every patch applies to the pinned Firefox
+#   identity  the identity generator replays the upstream launcher's recorded
+#             outputs, bit for bit
+#   program   the mumon program's and mumon-dev's tests, and the safety checks
+#             of this repository's workflows
+#
+# A push to main of either repository starts it (their check.yml); the result
+# goes back to the mumon commit as the status "check". The check app's token
+# (vars.CHECK_APP_CLIENT_ID, secrets.CHECK_APP_KEY) may only post that status.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of the source repository"
+        default: "main"
+      workspace_ref:
+        description: "Branch, tag or commit of mumon-workspace (the build tools and tests)"
+        default: "main"
+
+permissions: {}
+
+concurrency:
+  group: check-${{ inputs.ref }}-${{ inputs.workspace_ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  SOURCE_REPO: cyberkunju/mumon
+  WORKSPACE_REPO: cyberkunju/mumon-workspace
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    env:
+      BUILD_TARGET: windows,x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Lay the build tools and tests over the source
+        run: bash .workspace/tools/compose.sh
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # 22.15 or later: the fpgen model is zstd-compressed (node:zlib).
+          node-version: "22.x"
+      - name: Build the identity generator
+        # Generates browser/additions/mumon/identity (not in the repository),
+        # which the additions copy below picks up.
+        working-directory: browser/identity
+        run: |
+          npm ci --ignore-scripts
+          node build.mjs
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y aria2
+      - name: Static checks
+        working-directory: browser
+        run: python3 scripts/check-input-dispatch.py
+      - name: Engine module tests
+        run: |
+          files=(browser/tests/mumon/*.test.mjs)
+          test -f "${files[0]}" || { echo "::error::no engine tests found"; exit 1; }
+          node --test "${files[@]}"
+      - name: Fetch Firefox and copy the additions
+        working-directory: browser
+        run: make setup-minimal
+      - name: Apply the patches
+        working-directory: browser
+        run: make dir
+      - name: Check the rebrand reached the tree
+        run: |
+          src=$(ls -d browser/mumon-*/)
+          test -f "$src/browser/branding/mumon/configure.sh"
+          test -f "$src/browser/app/mumon.exe.manifest"
+          test -f "$src/lw/mumon.cfg"
+          test -f "$src/mumon/Boot.sys.mjs"
+          test -f "$src/mumon/Identity.sys.mjs"
+          test -f "$src/mumon/identity/IdentityCore.sys.mjs"
+          test -f "$src/mumon/identity/data/fpgen/values.txt"
+          grep -q '"/mumon"' "$src/lw/moz.build"
+          grep -q 'MOZ_APP_NAME=mumon' "$src/browser/branding/mumon/configure.sh"
+          grep -q 'imply_option("MOZ_APP_UA_NAME", "Firefox")' "$src/browser/moz.configure"
+          echo "rebrand present in $src"
+
+  identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - name: Lay the build tools and tests over the source
+        run: bash .workspace/tools/compose.sh
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # The goldens assume 3.14: sum() over mixed ints and floats rounds differently before it.
+          python-version: "3.14"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
+      - name: Install the Python launcher and its model
+        run: |
+          python -m pip install -e python
+          python python/scripts/pin-fpgen-model.py
+      - name: Record the Python goldens
+        env:
+          PYTHONUTF8: "1"
+        run: python browser/identity/upstream/scripts/golden/identity_golden.py
+      - name: Install the generator's build tools
+        working-directory: browser/identity
+        run: npm ci --ignore-scripts
+      - name: Replay them through the bundle
+        working-directory: browser/identity
+        run: node --test "tests/*.test.mjs"
+
+  program:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .build
+          persist-credentials: false
+      - name: The mumon program's tests
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo test --release --locked --manifest-path cli/Cargo.toml
+      - name: mumon-dev's tests
+        run: cargo test --release --locked --manifest-path .workspace/tools/mumon-dev/Cargo.toml
+      - name: The safety checks of this repository's workflows
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 .workspace/tools/check_build_workflows.py .build
+
+  report:
+    needs: [prepare, identity, program]
+    if: always() && vars.CHECK_APP_CLIENT_ID != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.CHECK_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHECK_APP_KEY }}
+          owner: cyberkunju
+          repositories: mumon
+          permission-statuses: write
+      - name: Post the result on the mumon commit
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          REF: ${{ inputs.ref }}
+          RESULTS: ${{ needs.prepare.result }} ${{ needs.identity.result }} ${{ needs.program.result }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The commit prepare checked out, or the dispatched one if it never got that far.
+          if [ -z "$SHA" ]; then
+            [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit to report on"; exit 1; }
+            SHA=$REF
+          fi
+          state=success
+          for r in $RESULTS; do [ "$r" = success ] || state=failure; done
+          gh api "repos/cyberkunju/mumon/statuses/$SHA" -f state="$state" -f context=check \
+            -f target_url="$URL" -f description="prepare, identity, program: $RESULTS" > /dev/null
+          echo "check: $state on $SHA ($RESULTS)" | tee -a "$GITHUB_STEP_SUMMARY"

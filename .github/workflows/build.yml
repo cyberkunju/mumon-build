@@ -1,9 +1,11 @@
 name: build
 
-# Builds the Mumon browser from its private source repository, on public runners
+# Builds the Mumon browser from its private repositories, on public runners
 # (4 vCPU, 16 GB), and publishes each package here as an encrypted release.
 #
-# The source is checked out with a read-only deploy key on that one repository.
+# The source (mumon) and the build tools and tests (mumon-workspace) are checked
+# out with a read-only deploy key each; the tools are laid over the source, so
+# every file is where the build expects it.
 # Nothing here runs on a pull request or a push, so no secret is reachable from a
 # fork. A package is a 7z (AES-256, file names hidden); the key is a secret of this
 # repository and of the machine that provisions the browser, and is not published.
@@ -20,6 +22,9 @@ on:
       ref:
         description: "Branch, tag or commit of the source repository"
         default: "main"
+      workspace_ref:
+        description: "Branch, tag or commit of mumon-workspace (the build tools and tests)"
+        default: "main"
       prepare_only:
         description: "Only prove the patches apply; build nothing"
         type: boolean
@@ -34,6 +39,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.12"
   SOURCE_REPO: cyberkunju/mumon
+  WORKSPACE_REPO: cyberkunju/mumon-workspace
 
 jobs:
   plan:
@@ -83,6 +89,15 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - name: Lay the build tools and tests over the source
+        run: bash .workspace/tools/compose.sh
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -172,6 +187,15 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - name: Lay the build tools and tests over the source
+        run: bash .workspace/tools/compose.sh
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -345,11 +369,12 @@ jobs:
           test -f "${pkgs[0]}"
           tag="build-${{ github.run_number }}-${{ matrix.name }}"
           src=$(git rev-parse HEAD)
+          ws=$(git -C .workspace rev-parse HEAD)
           # --target main, not this run's commit: a workflow token may not create a
           # tag at an older commit that changed a workflow file (measured: 403).
           gh release create "$tag" "${pkgs[@]}" --repo "$GITHUB_REPOSITORY" --target main \
             --prerelease --title "Mumon build ${{ github.run_number }} (${{ matrix.name }})" \
-            --notes "Source commit $src, run ${{ github.run_id }}. Encrypted 7z (AES-256)."
+            --notes "Source commit $src, workspace commit $ws, run ${{ github.run_id }}. Encrypted 7z (AES-256)."
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Upload the build log

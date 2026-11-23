@@ -16,7 +16,8 @@ name: verify
 # they serve the local sites, launch both builds for the value diff, and
 # install the browser's system libraries on Linux.
 #
-# The source is read with the same read-only deploy key as the build.
+# The source and the workspace (the tests, mumon-dev) are read with the same
+# read-only deploy keys as the build.
 
 on:
   workflow_dispatch:
@@ -28,7 +29,10 @@ on:
         description: "Comma-separated: windows-x86_64, linux-x86_64, linux-arm64, macos-arm64, macos-x86_64"
         default: "linux-x86_64,linux-arm64,macos-arm64,macos-x86_64,windows-x86_64"
       ref:
-        description: "Branch, tag or commit of the source repository (the mumon program and the tests)"
+        description: "Branch, tag or commit of the source repository (the mumon program)"
+        default: "main"
+      workspace_ref:
+        description: "Branch, tag or commit of mumon-workspace (the build tools and tests)"
         default: "main"
       dev_copy:
         description: "Test this source's engine and settings on a copy of the build (mumon-dev install) instead of the build as published; publishes nothing"
@@ -50,6 +54,7 @@ concurrency:
 
 env:
   SOURCE_REPO: cyberkunju/mumon
+  WORKSPACE_REPO: cyberkunju/mumon-workspace
 
 jobs:
   plan:
@@ -113,6 +118,15 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.MUMON_DEPLOY_KEY }}
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WORKSPACE_REPO }}
+          ref: ${{ inputs.workspace_ref }}
+          ssh-key: ${{ secrets.WORKSPACE_DEPLOY_KEY }}
+          path: .workspace
+          persist-credentials: false
+      - name: Lay the build tools and tests over the source
+        run: bash .workspace/tools/compose.sh
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -151,8 +165,9 @@ jobs:
           exe=mumon; [ "${{ matrix.os }}" = windows ] && exe=mumon.exe
           mkdir -p bin
           cp "cli/target/${T:+$T/}release/$exe" "bin/$exe"
+          cargo build --release --locked --manifest-path .workspace/tools/mumon-dev/Cargo.toml
           dev=mumon-dev; [ "${{ matrix.os }}" = windows ] && dev=mumon-dev.exe
-          cp "cli/target/${T:+$T/}release/$dev" "bin/$dev"
+          cp ".workspace/tools/mumon-dev/target/release/$dev" "bin/$dev"
           ls -l bin
           echo "MUMON=$PWD/bin/$exe" >> "$GITHUB_ENV"
           echo "MUMON_DEV=$PWD/bin/$dev" >> "$GITHUB_ENV"
