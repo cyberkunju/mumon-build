@@ -31,7 +31,7 @@ on:
         description: "Branch, tag or commit of the source repository (the mumon program and the tests)"
         default: "main"
       dev_copy:
-        description: "Test this source's engine and settings on a copy of the build (tests/e2e/dev_install.py) instead of the build as published; publishes nothing"
+        description: "Test this source's engine and settings on a copy of the build (mumon-dev install) instead of the build as published; publishes nothing"
         type: boolean
         default: false
       publish_cli:
@@ -151,8 +151,11 @@ jobs:
           exe=mumon; [ "${{ matrix.os }}" = windows ] && exe=mumon.exe
           mkdir -p bin
           cp "cli/target/${T:+$T/}release/$exe" "bin/$exe"
+          dev=mumon-dev; [ "${{ matrix.os }}" = windows ] && dev=mumon-dev.exe
+          cp "cli/target/${T:+$T/}release/$dev" "bin/$dev"
           ls -l bin
           echo "MUMON=$PWD/bin/$exe" >> "$GITHUB_ENV"
+          echo "MUMON_DEV=$PWD/bin/$dev" >> "$GITHUB_ENV"
 
       - name: Engine logic (Node)
         id: node
@@ -176,18 +179,13 @@ jobs:
         run: |
           set -euo pipefail
           (cd browser/identity && npm ci --ignore-scripts && node build.mjs)
-          DEV=$(python - <<'EOF'
-          import os, shutil, tempfile
-          from pathlib import Path
-          exe = Path(os.environ["EXE"])
-          app = next((p for p in exe.parents if p.suffix == ".app"), None)
-          root = app or exe.parent
-          dst = Path(tempfile.mkdtemp(prefix="mumon-devcopy-")) / root.name
-          shutil.copytree(root, dst, symlinks=True)
-          print(dst / exe.relative_to(root))
-          EOF
-          )
-          python tests/e2e/dev_install.py --dir "$(dirname "$DEV")"
+          # The installed browser's folder (macOS: its .app), copied whole.
+          root=$(dirname "$EXE")
+          case "$EXE" in *.app/*) root="${EXE%%.app/*}.app" ;; esac
+          dst="$(mktemp -d)/$(basename "$root")"
+          cp -a "$root" "$dst"
+          DEV="$dst${EXE#"$root"}"
+          "$MUMON_DEV" install --dir "$(dirname "$DEV")" --repo "$PWD"
           echo "EXE=$DEV" >> "$GITHUB_ENV"
 
       - name: mumon verify, with no Python on PATH
