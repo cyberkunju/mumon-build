@@ -131,6 +131,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -165,12 +167,8 @@ jobs:
           exe=mumon; [ "${{ matrix.os }}" = windows ] && exe=mumon.exe
           mkdir -p bin
           cp "cli/target/${T:+$T/}release/$exe" "bin/$exe"
-          cargo build --release --locked --manifest-path .workspace/tools/mumon-dev/Cargo.toml
-          dev=mumon-dev; [ "${{ matrix.os }}" = windows ] && dev=mumon-dev.exe
-          cp ".workspace/tools/mumon-dev/target/release/$dev" "bin/$dev"
           ls -l bin
           echo "MUMON=$PWD/bin/$exe" >> "$GITHUB_ENV"
-          echo "MUMON_DEV=$PWD/bin/$dev" >> "$GITHUB_ENV"
 
       - name: Engine logic (Node)
         id: node
@@ -193,6 +191,9 @@ jobs:
         if: inputs.dev_copy
         run: |
           set -euo pipefail
+          cargo build --release --locked --manifest-path .workspace/tools/mumon-dev/Cargo.toml
+          dev=mumon-dev; [ "${{ matrix.os }}" = windows ] && dev=mumon-dev.exe
+          MUMON_DEV="$PWD/.workspace/tools/mumon-dev/target/release/$dev"
           (cd browser/identity && npm ci --ignore-scripts && node build.mjs)
           # The installed browser's folder (macOS: its .app), copied whole.
           root=$(dirname "$EXE")

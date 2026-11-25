@@ -105,6 +105,8 @@ jobs:
         with:
           # 22.15 or later: the fpgen model is zstd-compressed (node:zlib).
           node-version: "22.x"
+          cache: npm
+          cache-dependency-path: browser/identity/package-lock.json
       - name: Build the identity generator
         # Generates browser/additions/mumon/identity (not in the repository),
         # which the additions copy below picks up.
@@ -144,13 +146,16 @@ jobs:
           echo "rebrand present in $src"
 
   build:
-    needs: [plan, prepare]
+    # Not after prepare: each build replays the patches itself, so waiting for
+    # prepare's proof only delays it (prepare still fails fast beside it).
+    needs: plan
     if: needs.plan.outputs.build == 'true'
     name: build ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: write # publishes the package as a pre-release
+      actions: write # removes this target's older compiler caches
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -204,6 +209,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22.x"
+          cache: npm
+          cache-dependency-path: browser/identity/package-lock.json
 
       - name: Build the identity generator
         working-directory: browser/identity
@@ -336,17 +343,45 @@ jobs:
           path: .sccache
           key: sccache-${{ matrix.name }}-${{ github.run_id }}
 
+      - name: Keep one compiler cache per target
+        # Every run saves a new entry; the older ones of this target are removed
+        # once it is there, so all targets fit the repository's 10 GB and none
+        # is evicted for another's.
+        if: always() && steps.cache.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: sccache-${{ matrix.name }}-
+          KEEP: sccache-${{ matrix.name }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          keys=$(gh cache list --repo "$GITHUB_REPOSITORY" --key "$PREFIX" --limit 100 --json id,key)
+          if ! jq -e --arg k "$KEEP" 'any(.[]; .key == $k)' <<<"$keys" > /dev/null; then
+            echo "this run's cache is not saved; the older ones stay"
+            exit 0
+          fi
+          jq -r --arg k "$KEEP" '.[] | select(.key != $k) | .id' <<<"$keys" | while read -r id; do
+            gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true
+          done
+
       - name: Encrypt the package
         env:
           PACKAGE_KEY: ${{ secrets.MUMON_PACKAGE_KEY }}
         run: |
           set -euo pipefail
           zip=$(ls browser/dist/mumon-*.zip | head -1)
-          out="${zip%.zip}.7z"
-          # Stored, not compressed (the zip already is), with the file names hidden.
-          7z a -t7z -mx=0 -mhe=on "-p$PACKAGE_KEY" "$out" "$zip" > /dev/null
-          7z t "-p$PACKAGE_KEY" "$out" | tail -3
+          out="$PWD/${zip%.zip}.7z"
+          # The browser's files themselves in one solid LZMA2 archive, file names
+          # hidden, compressed in blocks on every core (the mumon program decodes
+          # them on every core too); not a zip inside a stored 7z. Unix modes are
+          # kept by unzip and stored by 7z.
+          pkg="$RUNNER_TEMP/pkg"
+          rm -rf "$pkg"
+          mkdir -p "$pkg"
+          unzip -q "$zip" -d "$pkg"
           rm "$zip"
+          (cd "$pkg" && 7z a -t7z -m0=lzma2 -mx=7 -mmt=on -ms=on -mhe=on "-p$PACKAGE_KEY" "$out" . > /dev/null)
+          rm -rf "$pkg"
+          7z t "-p$PACKAGE_KEY" "$out" | tail -3
           ls -l browser/dist
           sha256sum "$out"
 
