@@ -29,6 +29,10 @@ on:
         description: "Only prove the patches apply; build nothing"
         type: boolean
         default: false
+      lto:
+        description: "Experiment: cross-language LTO (its own compiler cache); the package is kept as an artifact, nothing is published"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -163,7 +167,10 @@ jobs:
       # `make dir` writes the mozconfig and adds the Rust targets from BUILD_TARGET.
       BUILD_TARGET: ${{ matrix.target }},${{ matrix.arch }}
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_CACHE_SIZE: 5G
+      SCCACHE_CACHE_SIZE: ${{ inputs.lto && '1200M' || '5G' }}
+      # LTO objects are not the normal ones: their own cache entries.
+      CACHE_PREFIX: ${{ inputs.lto && 'sccache-lto-' || 'sccache-' }}${{ matrix.name }}-
+      MUMON_LTO: ${{ inputs.lto && '1' || '' }}
     steps:
       - name: Maximize build space
         uses: AdityaGarg8/remove-unwanted-software@8831c82abf29b34eb2caac48d5f999ecfc0d8eef # v4.1
@@ -265,9 +272,9 @@ jobs:
           # The run id makes every save a new entry, so a build that was cut off
           # still leaves its work behind. A restore takes the newest earlier one.
           # sccache entries are keyed by their inputs, so an older cache is still valid.
-          key: sccache-${{ matrix.name }}-${{ github.run_id }}
+          key: ${{ env.CACHE_PREFIX }}${{ github.run_id }}
           restore-keys: |
-            sccache-${{ matrix.name }}-
+            ${{ env.CACHE_PREFIX }}
 
       - name: Prepare the source tree
         # setup-minimal (fetches the tarball) -> dir (patches) -> mozbootstrap
@@ -341,7 +348,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .sccache
-          key: sccache-${{ matrix.name }}-${{ github.run_id }}
+          key: ${{ env.CACHE_PREFIX }}${{ github.run_id }}
 
       - name: Keep one compiler cache per target
         # Every run saves a new entry; the older ones of this target are removed
@@ -350,8 +357,8 @@ jobs:
         if: always() && steps.cache.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
-          PREFIX: sccache-${{ matrix.name }}-
-          KEEP: sccache-${{ matrix.name }}-${{ github.run_id }}
+          PREFIX: ${{ env.CACHE_PREFIX }}
+          KEEP: ${{ env.CACHE_PREFIX }}${{ github.run_id }}
         run: |
           set -euo pipefail
           keys=$(gh cache list --repo "$GITHUB_REPOSITORY" --key "$PREFIX" --limit 100 --json id,key)
@@ -396,6 +403,7 @@ jobs:
 
       - name: Publish the package
         id: publish
+        if: ${{ !inputs.lto }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
