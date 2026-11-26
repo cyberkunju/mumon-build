@@ -276,6 +276,26 @@ jobs:
           restore-keys: |
             ${{ env.CACHE_PREFIX }}
 
+      - name: A Rust whose LLVM is the bootstrapped clang's
+        # Cross-language LTO merges Rust's and clang's LLVM bitcode, so both must
+        # be one LLVM: the stable Rust (LLVM 23) against Firefox 158's clang
+        # (LLVM 22) failed the xul link ("Not an int attribute").
+        if: inputs.lto
+        env:
+          LTO_LLVM: "22"
+        run: |
+          set -euo pipefail
+          for v in 1.98 1.97 1.96 1.95 1.94; do
+            rustup toolchain install "$v" --profile minimal --no-self-update > /dev/null 2>&1 || continue
+            if rustc "+$v" -vV | grep -q "^LLVM version: ${LTO_LLVM}\."; then
+              rustup default "$v"
+              rustc -vV
+              exit 0
+            fi
+          done
+          echo "::error::no Rust release with LLVM $LTO_LLVM"
+          exit 1
+
       - name: Prepare the source tree
         # setup-minimal (fetches the tarball) -> dir (patches) -> mozbootstrap
         # (toolchains), retrying the two that use the network.
