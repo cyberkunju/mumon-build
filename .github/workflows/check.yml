@@ -80,6 +80,13 @@ jobs:
         run: |
           npm ci --ignore-scripts
           node build.mjs
+      - name: Build the extractor
+        # browser/extract (Rust) to WebAssembly: additions/mumon/extract/extract.wasm,
+        # not in the repository, which the additions copy picks up.
+        run: |
+          rustup +stable target add wasm32-unknown-unknown
+          cargo +stable build --release --locked --target wasm32-unknown-unknown --manifest-path browser/extract/Cargo.toml
+          cp browser/extract/target/wasm32-unknown-unknown/release/mumon_extract.wasm browser/additions/mumon/extract/extract.wasm
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y aria2
       - name: Static checks
@@ -106,6 +113,7 @@ jobs:
           test -f "$src/mumon/Identity.sys.mjs"
           test -f "$src/mumon/identity/IdentityCore.sys.mjs"
           test -f "$src/mumon/identity/data/fpgen/values.txt"
+          test -f "$src/mumon/extract/extract.wasm"
           grep -q '"/mumon"' "$src/lw/moz.build"
           grep -q 'MOZ_APP_NAME=mumon' "$src/browser/branding/mumon/configure.sh"
           grep -q 'imply_option("MOZ_APP_UA_NAME", "Firefox")' "$src/browser/moz.configure"
@@ -186,6 +194,8 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           cargo test --release --locked --manifest-path cli/Cargo.toml
+      - name: The extractor's tests
+        run: cargo test --release --locked --manifest-path browser/extract/Cargo.toml
       - name: mumon-dev's tests
         run: cargo test --release --locked --manifest-path .workspace/tools/mumon-dev/Cargo.toml
       - name: The safety checks of this repository's workflows

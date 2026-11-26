@@ -195,6 +195,9 @@ jobs:
           dev=mumon-dev; [ "${{ matrix.os }}" = windows ] && dev=mumon-dev.exe
           MUMON_DEV="$PWD/.workspace/tools/mumon-dev/target/release/$dev"
           (cd browser/identity && npm ci --ignore-scripts && node build.mjs)
+          rustup target add wasm32-unknown-unknown
+          cargo build --release --locked --target wasm32-unknown-unknown --manifest-path browser/extract/Cargo.toml
+          cp browser/extract/target/wasm32-unknown-unknown/release/mumon_extract.wasm browser/additions/mumon/extract/extract.wasm
           # The installed browser's folder (macOS: its .app), copied whole.
           root=$(dirname "$EXE")
           case "$EXE" in *.app/*) root="${EXE%%.app/*}.app" ;; esac
